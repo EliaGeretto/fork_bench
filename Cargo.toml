@@ -1,0 +1,13 @@
+[package]
+name = "fork_bench"
+version = "0.1.0"
+authors = ["Elia Geretto <elia.f.geretto@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+nix = "0.21.0"
+byteorder = "1.4.3"
+hdrhistogram = "7.3.0"
+procfs = "0.9.1"
+structopt = "0.3.21"
+csv = "1.1.6"
