@@ -106,41 +106,47 @@ fn benchmark_fork() -> Stats {
     (rss as usize, stats)
 }
 
-fn benchmark_fork_with_map(pages: usize, huge_pages: bool) -> Stats {
-    println!("mapping {} pages", pages);
-    let size = pages * PAGE_SIZE;
+fn benchmark_fork_with_map(pages: usize, group_pages: usize, huge_pages: bool) -> Stats {
+    println!("mapping {} pages in groups of {}", pages, group_pages);
 
-    let map = if size > 0 {
-        let map = unsafe {
-            mmap(
-                ptr::null_mut(),
-                size,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-            .expect("mmap failed")
-        };
+    let group_size = group_pages * PAGE_SIZE;
 
-        if huge_pages {
-            unsafe { madvise(map, size, MmapAdvise::MADV_HUGEPAGE).expect("madvise failed") };
+    let mut maps = Vec::new();
+    if pages > 0 {
+        assert_eq!(pages % group_pages, 0);
+
+        for _ in (0..pages).step_by(group_pages) {
+            let map = unsafe {
+                mmap(
+                    ptr::null_mut(),
+                    group_size,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .expect("mmap failed")
+            };
+
+            if huge_pages {
+                unsafe {
+                    madvise(map, group_size, MmapAdvise::MADV_HUGEPAGE).expect("madvise failed")
+                };
+            }
+
+            for idx in (0..group_size).step_by(PAGE_SIZE) {
+                unsafe { *map.add(idx).cast::<u8>() = 1 };
+            }
+
+            maps.push(map);
         }
-
-        for idx in (0..size).step_by(PAGE_SIZE) {
-            unsafe { *map.add(idx).cast::<u8>() = 1 };
-        }
-
-        Some(map)
-    } else {
-        None
-    };
+    }
 
     let stats = benchmark_fork();
 
-    if let Some(map) = map {
+    for map in maps {
         unsafe {
-            munmap(map, size).expect("munmap failed");
+            munmap(map, group_size).expect("munmap failed");
         }
     }
 
@@ -153,6 +159,8 @@ struct Opt {
     output_file: PathBuf,
     #[structopt(long)]
     huge_pages: bool,
+    #[structopt(long)]
+    group_pages: Option<usize>,
 }
 
 fn main() {
@@ -160,7 +168,9 @@ fn main() {
 
     let mut points = Vec::new();
     for pages_count in &[0, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000] {
-        let (pages, (_, mean, _)) = benchmark_fork_with_map(*pages_count, opt.huge_pages);
+        let group_pages = opt.group_pages.unwrap_or(*pages_count);
+        let (pages, (_, mean, _)) =
+            benchmark_fork_with_map(*pages_count, group_pages, opt.huge_pages);
         println!();
         points.push((pages, mean));
     }
