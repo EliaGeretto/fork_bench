@@ -12,7 +12,7 @@ def main(args):
     x_data = data["pages"].values.reshape((-1, 1))
 
     model = LinearRegression()
-    model.fit(x_data, data["time"])
+    model.fit(x_data, data["time_mean"])
 
     print(f"fork with no maps: {model.intercept_:.2f} us")
 
@@ -20,7 +20,7 @@ def main(args):
     print(f"cost of {example_pages} pages: {model.coef_[0] * example_pages:.2f} us")
 
     fig, ax = plt.subplots()
-    ax.scatter(x_data, data["time"])
+    ax.scatter(x_data, data["time_mean"])
     ax.plot(x_data, model.predict(x_data))
     ax.set_xlabel("RSS (pages)")
     ax.set_ylabel("Time (us)")

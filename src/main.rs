@@ -1,4 +1,6 @@
+use core::slice;
 use std::{
+    ffi::c_void,
     io::Cursor,
     mem::size_of,
     path::PathBuf,
@@ -30,7 +32,7 @@ const MEASURE_DURATION: Duration = Duration::from_secs(5);
 
 type Stats = (usize, (f64, f64, f64));
 
-fn measure_fork() -> anyhow::Result<Duration> {
+fn measure_fork(maps: &mut [&mut [u8]], _page_size: usize) -> anyhow::Result<Duration> {
     let (pipe_rx, pipe_tx) = pipe().context("pipe failed")?;
 
     let fork_begin = Instant::now();
@@ -68,12 +70,19 @@ fn measure_fork() -> anyhow::Result<Duration> {
                 .unwrap();
             write(pipe_tx, &serialized_fork_micros).expect("write failed");
 
+            // Touch all the bytes in the maps to mess with CPU caches and TLB.
+            for map in maps {
+                for entry in map.iter_mut() {
+                    *entry = 1;
+                }
+            }
+
             process::exit(0);
         }
     }
 }
 
-fn measure_wait() -> anyhow::Result<Duration> {
+fn measure_wait(_maps: &mut [&mut [u8]], _page_size: usize) -> anyhow::Result<Duration> {
     let fork_begin = Instant::now();
     match unsafe { fork().context("fork failed")? } {
         ForkResult::Parent { child } => {
@@ -90,14 +99,15 @@ fn measure_wait() -> anyhow::Result<Duration> {
             Ok(wait_time)
         }
         ForkResult::Child => {
+            // Touching the maps would mean corrupting the measurement
             process::exit(0);
         }
     }
 }
 
-fn benchmark_func<F>(measure_func: F) -> anyhow::Result<Stats>
+fn benchmark_func<F>(mut measure_func: F) -> anyhow::Result<Stats>
 where
-    F: Fn() -> anyhow::Result<Duration>,
+    F: FnMut() -> anyhow::Result<Duration>,
 {
     let mut hist =
         Histogram::<u16>::new_with_max(MAX_FORK_MICROS, 3).context("histogram creation failed")?;
@@ -136,18 +146,18 @@ where
     Ok((rss as usize, stats))
 }
 
-fn benchmark_fork() -> anyhow::Result<Stats> {
+fn benchmark_fork(maps: &mut [&mut [u8]], page_size: usize) -> anyhow::Result<Stats> {
     println!("measuring fork");
-    benchmark_func(measure_fork)
+    benchmark_func(|| measure_fork(maps, page_size))
 }
 
 // This is an approximation since it includes also the time taken for the parent
 // process to wake up.
-fn benchmark_exit() -> anyhow::Result<Stats> {
+fn benchmark_exit(maps: &mut [&mut [u8]], page_size: usize) -> anyhow::Result<Stats> {
     println!("measuring fork");
-    let fork_stats = benchmark_func(measure_fork)?;
+    let fork_stats = benchmark_func(|| measure_fork(maps, page_size))?;
     println!("measuring wait");
-    let wait_stats = benchmark_func(measure_wait)?;
+    let wait_stats = benchmark_func(|| measure_wait(maps, page_size))?;
 
     Ok((
         fork_stats.0,
@@ -167,7 +177,7 @@ fn run_benchmark_with_map<F>(
     huge_pages: bool,
 ) -> anyhow::Result<Stats>
 where
-    F: FnOnce() -> anyhow::Result<Stats>,
+    F: FnOnce(&mut [&mut [u8]], usize) -> anyhow::Result<Stats>,
 {
     let huge_pages_msg = if huge_pages { " with huge pages" } else { "" };
     println!(
@@ -200,19 +210,21 @@ where
                 };
             }
 
+            let map = unsafe { slice::from_raw_parts_mut(map.cast::<u8>(), group_size) };
+
             for idx in (0..group_size).step_by(page_size) {
-                unsafe { *map.add(idx).cast::<u8>() = 1 };
+                map[idx] = 1;
             }
 
             maps.push(map);
         }
     }
 
-    let stats = target_function();
+    let stats = target_function(&mut maps, page_size);
 
     for map in maps {
         unsafe {
-            munmap(map, group_size).context("munmap failed")?;
+            munmap(map.as_mut_ptr().cast::<c_void>(), group_size).context("munmap failed")?;
         }
     }
 
@@ -260,7 +272,7 @@ fn main() -> anyhow::Result<()> {
     let mut points = Vec::new();
     for pages_count in &TEST_PAGE_NUMS {
         let group_pages = opt.group_pages.unwrap_or(*pages_count);
-        let (pages, (_, mean, _)) = run_benchmark_with_map(
+        let stats = run_benchmark_with_map(
             target_function,
             *pages_count,
             group_pages,
@@ -268,16 +280,21 @@ fn main() -> anyhow::Result<()> {
             opt.huge_pages,
         )?;
         println!();
-        points.push((pages, mean));
+        points.push(stats);
     }
 
     let mut writer = Writer::from_path(opt.output_file).context("open output file failed")?;
     writer
-        .write_record(&["pages", "time"])
+        .write_record(&["pages", "time_lower_ci", "time_mean", "time_upper_ci"])
         .context("write failed")?;
-    for (pages, mean_time) in points {
+    for (pages, time_stats) in points {
         writer
-            .write_record(&[pages.to_string(), mean_time.to_string()])
+            .write_record(&[
+                pages.to_string(),
+                time_stats.0.to_string(),
+                time_stats.1.to_string(),
+                time_stats.2.to_string(),
+            ])
             .context("write failed")?;
     }
 
