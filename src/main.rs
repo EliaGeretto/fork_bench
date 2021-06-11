@@ -3,9 +3,11 @@ use std::{
     mem::size_of,
     path::PathBuf,
     process, ptr,
+    str::FromStr,
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, bail, Context};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use csv::Writer;
 use hdrhistogram::Histogram;
@@ -19,34 +21,44 @@ use nix::{
 use procfs::process::Process;
 use structopt::StructOpt;
 
-fn measure_fork() -> Duration {
-    let (pipe_rx, pipe_tx) = pipe().expect("pipe failed");
+const CI_95: f64 = 1.96;
+const MAX_FORK_MICROS: u64 = 10000;
+
+const TEST_PAGE_NUMS: [usize; 6] = [0, 1000, 2000, 3000, 4000, 5000];
+const WARMUP_DURATION: Duration = Duration::from_secs(1);
+const MEASURE_DURATION: Duration = Duration::from_secs(5);
+
+type Stats = (usize, (f64, f64, f64));
+
+fn measure_fork() -> anyhow::Result<Duration> {
+    let (pipe_rx, pipe_tx) = pipe().context("pipe failed")?;
 
     let fork_begin = Instant::now();
-    match unsafe { fork().expect("fork failed") } {
+    match unsafe { fork().context("fork failed")? } {
         ForkResult::Parent { child } => {
-            close(pipe_tx).expect("close failed");
+            close(pipe_tx).context("close failed")?;
 
             let mut serialized_fork_time = [0; size_of::<u64>()];
-            read(pipe_rx, &mut serialized_fork_time).expect("read failed");
+            read(pipe_rx, &mut serialized_fork_time).context("read failed")?;
             let mut reader = Cursor::new(serialized_fork_time);
             let fork_micros = reader.read_u64::<LittleEndian>().unwrap();
             let fork_time = Duration::from_micros(fork_micros);
 
-            close(pipe_rx).expect("close failed");
+            close(pipe_rx).context("close failed")?;
 
-            let status = wait().expect("wait failed");
+            let status = wait().context("wait failed")?;
             match status {
                 WaitStatus::Exited(pid, exit_code) => {
                     assert_eq!(child, pid);
                     assert_eq!(exit_code, 0);
                 }
-                _ => panic!("unexpected status"),
+                _ => bail!("unexpected status"),
             }
 
-            fork_time
+            Ok(fork_time)
         }
         ForkResult::Child => {
+            // In the child the program should crash if something goes wrong.
             let fork_time = fork_begin.elapsed();
             close(pipe_rx).expect("close failed");
 
@@ -61,40 +73,58 @@ fn measure_fork() -> Duration {
     }
 }
 
-const WARMUP_DURATION: Duration = Duration::from_secs(1);
-const MEASURE_DURATION: Duration = Duration::from_secs(5);
-const CI_95: f64 = 1.96;
-const MAX_FORK_MICROS: u64 = 10000;
-const PAGE_SIZE: usize = 4096;
+fn measure_wait() -> anyhow::Result<Duration> {
+    let fork_begin = Instant::now();
+    match unsafe { fork().context("fork failed")? } {
+        ForkResult::Parent { child } => {
+            let status = wait().context("wait failed")?;
+            let wait_time = fork_begin.elapsed();
+            match status {
+                WaitStatus::Exited(pid, exit_code) => {
+                    assert_eq!(child, pid);
+                    assert_eq!(exit_code, 0);
+                }
+                _ => bail!("unexpected status"),
+            }
 
-type Stats = (usize, (f64, f64, f64));
+            Ok(wait_time)
+        }
+        ForkResult::Child => {
+            process::exit(0);
+        }
+    }
+}
 
-fn benchmark_fork() -> Stats {
-    let mut hist = Histogram::<u16>::new_with_max(MAX_FORK_MICROS, 3).unwrap();
+fn benchmark_func<F>(measure_func: F) -> anyhow::Result<Stats>
+where
+    F: Fn() -> anyhow::Result<Duration>,
+{
+    let mut hist =
+        Histogram::<u16>::new_with_max(MAX_FORK_MICROS, 3).context("histogram creation failed")?;
 
     println!("warmup for: {:?}", WARMUP_DURATION);
     let mut warmup_iters = 0;
     let warmup_begin = Instant::now();
     while warmup_begin.elapsed() < WARMUP_DURATION {
-        measure_fork();
+        measure_func()?;
         warmup_iters += 1;
     }
 
     let speed = warmup_iters as f64 / warmup_begin.elapsed().as_secs_f64();
     println!("speed: {:.2} iters/sec", speed);
 
-    let me = Process::myself().expect("cannot access procfs");
+    let me = Process::myself().context("cannot access procfs")?;
     let rss = me.stat.rss;
     println!("process rss: {} pages", rss);
 
     println!("measuring for: {:?}", MEASURE_DURATION);
     let measure_begin = Instant::now();
     while measure_begin.elapsed() < MEASURE_DURATION {
-        let fork_time = measure_fork();
-        hist += fork_time.as_micros() as u64;
+        let iter_time = measure_func()?;
+        hist += iter_time.as_micros() as u64;
     }
 
-    let me = Process::myself().expect("cannot access procfs");
+    let me = Process::myself().context("cannot access procfs")?;
     println!("rss changed by: {} pages", me.stat.rss - rss);
 
     let mean = hist.mean();
@@ -103,13 +133,49 @@ fn benchmark_fork() -> Stats {
     let stats = (mean - half_ci, mean, mean + half_ci);
     println!("[{:.2} {:.2} {:.2}]", stats.0, stats.1, stats.2);
 
-    (rss as usize, stats)
+    Ok((rss as usize, stats))
 }
 
-fn benchmark_fork_with_map(pages: usize, group_pages: usize, huge_pages: bool) -> Stats {
-    println!("mapping {} pages in groups of {}", pages, group_pages);
+fn benchmark_fork() -> anyhow::Result<Stats> {
+    println!("measuring fork");
+    benchmark_func(measure_fork)
+}
 
-    let group_size = group_pages * PAGE_SIZE;
+// This is an approximation since it includes also the time taken for the parent
+// process to wake up.
+fn benchmark_exit() -> anyhow::Result<Stats> {
+    println!("measuring fork");
+    let fork_stats = benchmark_func(measure_fork)?;
+    println!("measuring wait");
+    let wait_stats = benchmark_func(measure_wait)?;
+
+    Ok((
+        fork_stats.0,
+        (
+            wait_stats.1 .0 - fork_stats.1 .0,
+            wait_stats.1 .1 - fork_stats.1 .1,
+            wait_stats.1 .2 - fork_stats.1 .2,
+        ),
+    ))
+}
+
+fn run_benchmark_with_map<F>(
+    target_function: F,
+    pages: usize,
+    group_pages: usize,
+    page_size: usize,
+    huge_pages: bool,
+) -> anyhow::Result<Stats>
+where
+    F: FnOnce() -> anyhow::Result<Stats>,
+{
+    let huge_pages_msg = if huge_pages { " with huge pages" } else { "" };
+    println!(
+        "mapping {} pages in groups of {}{}",
+        pages, group_pages, huge_pages_msg
+    );
+
+    let group_size = group_pages * page_size;
 
     let mut maps = Vec::new();
     if pages > 0 {
@@ -125,16 +191,16 @@ fn benchmark_fork_with_map(pages: usize, group_pages: usize, huge_pages: bool) -
                     -1,
                     0,
                 )
-                .expect("mmap failed")
+                .context("mmap failed")?
             };
 
             if huge_pages {
                 unsafe {
-                    madvise(map, group_size, MmapAdvise::MADV_HUGEPAGE).expect("madvise failed")
+                    madvise(map, group_size, MmapAdvise::MADV_HUGEPAGE).context("madvise failed")?
                 };
             }
 
-            for idx in (0..group_size).step_by(PAGE_SIZE) {
+            for idx in (0..group_size).step_by(page_size) {
                 unsafe { *map.add(idx).cast::<u8>() = 1 };
             }
 
@@ -142,19 +208,37 @@ fn benchmark_fork_with_map(pages: usize, group_pages: usize, huge_pages: bool) -
         }
     }
 
-    let stats = benchmark_fork();
+    let stats = target_function();
 
     for map in maps {
         unsafe {
-            munmap(map, group_size).expect("munmap failed");
+            munmap(map, group_size).context("munmap failed")?;
         }
     }
 
     stats
 }
 
+enum Target {
+    Fork,
+    Exit,
+}
+
+impl FromStr for Target {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fork" => Ok(Target::Fork),
+            "exit" => Ok(Target::Exit),
+            _ => Err(anyhow!("unrecognized target: {}", s)),
+        }
+    }
+}
+
 #[derive(StructOpt)]
 struct Opt {
+    target: Target,
     #[structopt(parse(from_os_str))]
     output_file: PathBuf,
     #[structopt(long)]
@@ -163,25 +247,39 @@ struct Opt {
     group_pages: Option<usize>,
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
+    let target_function = match opt.target {
+        Target::Fork => benchmark_fork,
+        Target::Exit => benchmark_exit,
+    };
+
+    let page_size = procfs::page_size().context("retrieve page size failed")? as usize;
+
     let mut points = Vec::new();
-    for pages_count in &[0, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000] {
+    for pages_count in &TEST_PAGE_NUMS {
         let group_pages = opt.group_pages.unwrap_or(*pages_count);
-        let (pages, (_, mean, _)) =
-            benchmark_fork_with_map(*pages_count, group_pages, opt.huge_pages);
+        let (pages, (_, mean, _)) = run_benchmark_with_map(
+            target_function,
+            *pages_count,
+            group_pages,
+            page_size,
+            opt.huge_pages,
+        )?;
         println!();
         points.push((pages, mean));
     }
 
-    let mut writer = Writer::from_path(opt.output_file).expect("open output file failed");
+    let mut writer = Writer::from_path(opt.output_file).context("open output file failed")?;
     writer
         .write_record(&["pages", "time"])
-        .expect("write failed");
+        .context("write failed")?;
     for (pages, mean_time) in points {
         writer
             .write_record(&[pages.to_string(), mean_time.to_string()])
-            .expect("write failed");
+            .context("write failed")?;
     }
+
+    Ok(())
 }
